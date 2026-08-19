@@ -1,15 +1,24 @@
 // src/inngest/functions.ts
+import { gemini, createAgent } from "@inngest/agent-kit";
+
 import { inngest } from "./client";
 
 export const helloWorld = inngest.createFunction(
   { id: "hello-world", triggers: [{ event: "test/hello.world" }] },
   async ({ event, step }) => {
-    await step.sleep("wait-a-moment", "20s");
-    //for downloading the cover image
-    await step.sleep("wait-for-download", "10s");
-    //for saving the cover image
-    await step.sleep("wait-for-save", "5s");
-    //for generating the book from the cover image and text
-    return { message: `hello ${event.data.email}!` };
+    const summarizer = createAgent({
+      name: "summarizer",
+      system: "You are an expert summarizer. Summarize in 2 words.",
+      model: gemini({
+        model: "gemini-3.6-flash",
+        apiKey: process.env.GOOGLE_API_KEY,
+      }),
+    });
+
+    const { output } = await summarizer.run(
+      `Summarize the following text: ${event.data.value}`
+    );
+
+    return { output };
   }
 );
