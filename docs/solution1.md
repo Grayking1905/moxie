@@ -531,3 +531,472 @@ If you're using the specific OmniRoute project above, I can next give you the **
 [2]: https://www.inngest.com/docs/guides/background-jobs?utm_source=chatgpt.com "Background Jobs with Inngest | Setup Guide - Inngest Docs"
 [3]: https://www.inngest.com/docs?utm_source=chatgpt.com "Inngest Docs"
 [4]: https://github.com/inngest/agent-kit?utm_source=chatgpt.com "GitHub - inngest/agent-kit: AgentKit: Build multi-agent networks in TypeScript with deterministic routing and rich tooling via MCP. · GitHub"
+
+
+
+use the OmniRoute API as the AI backend for your Moxie background-agent jobs. In fact, given your current stack, that is the architecture I recommend.
+
+The important distinction is:
+
+Inngest runs the background job; OmniRoute supplies the model inference.
+
+OmniRoute exposes OpenAI-compatible endpoints such as /v1/chat/completions and /v1/responses, and its current project also supports MCP and A2A agent-oriented protocols.
+
+Recommended Moxie architecture
+User
+ │
+ ▼
+Next.js / tRPC
+ │
+ ▼
+Create Generation
+ │
+ ▼
+Inngest Event
+ │
+ ▼
+┌──────────────────────────────┐
+│       Moxie AI Job           │
+│                              │
+│ Load project                 │
+│ Build context                │
+│        │                     │
+│        ▼                     │
+│    OmniRoute API             │
+│        │                     │
+│        ├── Model A            │
+│        ├── Model B            │
+│        └── Model C            │
+│        │                     │
+│        ▼                     │
+│ Parse AI response             │
+│        │                     │
+│ Apply code changes            │
+│        │                     │
+│        ▼                     │
+│ E2B sandbox                   │
+│        │                     │
+│ Build / test                  │
+│        │                     │
+│   ┌────┴────┐                 │
+│   │         │                 │
+│ success    error              │
+│   │         │                 │
+│   │         ▼                 │
+│   │      OmniRoute            │
+│   │      debug/fix            │
+│   │         │                 │
+│   └─────────┘                 │
+└──────────────┬───────────────┘
+               ▼
+           PostgreSQL
+               │
+               ▼
+             UI
+The important part: don't use OmniRoute as the job queue
+
+Don't do this:
+
+Browser
+   ↓
+OmniRoute
+   ↓
+Long AI request
+
+Do this:
+
+Browser
+   ↓
+Inngest
+   ↓
+OmniRoute
+
+That gives you durable background execution, retries, and step-based orchestration from Inngest, while OmniRoute handles model/provider routing. Inngest is designed for background jobs and durable workflows.
+
+How your Moxie agent should work
+
+For example, user sends:
+
+Build a SaaS dashboard with authentication and PostgreSQL.
+
+Inngest starts
+generation.status = QUEUED
+
+Then:
+
+load project
+       ↓
+build AI context
+       ↓
+call OmniRoute
+       ↓
+generate plan
+       ↓
+generate file changes
+       ↓
+apply changes
+       ↓
+start E2B
+       ↓
+npm install
+       ↓
+npm run build
+       ↓
+inspect errors
+       ↓
+fix through OmniRoute
+       ↓
+build again
+       ↓
+preview ready
+
+This is a much better architecture than making one giant AI request.
+
+OmniRoute API
+
+The current OmniRoute project provides an OpenAI-compatible API. Its documented endpoints include:
+
+POST /v1/chat/completions
+POST /v1/responses
+GET  /v1/models
+
+among other endpoints.
+
+It also supports provider-specific routes and has configurable routing/fallback behavior.
+
+That means your Moxie worker can use a normal OpenAI-compatible SDK.
+
+For example:
+
+import OpenAI from "openai";
+
+
+const omni = new OpenAI({
+  apiKey: process.env.OMNIROUTE_API_KEY,
+  baseURL: process.env.OMNIROUTE_BASE_URL,
+});
+
+
+const response = await omni.chat.completions.create({
+  model: "your-model",
+  messages: [
+    {
+      role: "system",
+      content: SYSTEM_PROMPT,
+    },
+    {
+      role: "user",
+      content: USER_PROMPT,
+    },
+  ],
+});
+
+With the documented local/default API configuration, OmniRoute uses a base URL such as http://localhost:20128/v1; deployed installations can expose their own URL.
+
+Then put this inside Inngest
+
+Your architecture can be:
+
+export const generateApp = inngest.createFunction(
+  {
+    id: "moxie-generate-app",
+    retries: 3,
+  },
+  {
+    event: "moxie/generation.requested",
+  },
+  async ({ event, step }) => {
+
+
+    const project = await step.run(
+      "load-project",
+      async () => {
+        return getProject(event.data.projectId);
+      }
+    );
+
+
+    const context = await step.run(
+      "build-context",
+      async () => {
+        return buildProjectContext({
+          project,
+          prompt: event.data.prompt,
+        });
+      }
+    );
+
+
+    const aiResponse = await step.run(
+      "call-omniroute",
+      async () => {
+        return callOmniRoute({
+          prompt: event.data.prompt,
+          context,
+        });
+      }
+    );
+
+
+    const changes = await step.run(
+      "parse-changes",
+      async () => {
+        return parseAIResponse(aiResponse);
+      }
+    );
+
+
+    await step.run(
+      "apply-changes",
+      async () => {
+        await applyChanges(
+          event.data.projectId,
+          changes
+        );
+      }
+    );
+
+
+    const result = await step.run(
+      "run-e2b",
+      async () => {
+        return runSandbox(
+          event.data.projectId
+        );
+      }
+    );
+
+
+    return result;
+  }
+);
+
+The key point is that the OmniRoute call is simply one durable step inside your Inngest workflow.
+
+Even better: split your agent into multiple jobs
+
+Don't make a single generateApp function handle everything forever.
+
+Use:
+
+moxie/
+├── generation.requested
+├── agent.plan
+├── agent.execute
+├── build.requested
+├── debug.requested
+├── deployment.requested
+└── review.requested
+
+For example:
+
+                 Inngest
+                    │
+       ┌────────────┼────────────┐
+       ▼            ▼            ▼
+   Generation     Debug        Refactor
+       │            │            │
+       └────────────┼────────────┘
+                    ▼
+                OmniRoute
+                    │
+                    ▼
+                 AI Model
+                    │
+                    ▼
+                Agent Tool
+                    │
+                    ▼
+                   E2B
+OmniRoute + agent tools
+
+This is where it becomes interesting.
+
+The AI model should not directly manipulate your database or host machine.
+
+Instead the agent gives the model controlled tools:
+
+readFile()
+writeFile()
+editFile()
+
+
+searchFiles()
+
+
+runCommand()
+installPackage()
+
+
+runBuild()
+runTests()
+
+
+getLogs()
+getBrowserErrors()
+
+
+getDatabaseSchema()
+createMigration()
+
+Then:
+
+OmniRoute
+   ↓
+Model
+   ↓
+tool call
+   ↓
+Moxie agent runtime
+   ↓
+tool execution
+   ↓
+result back to model
+
+So the real architecture becomes:
+
+               Inngest
+                  │
+                  ▼
+            Moxie Agent
+                  │
+                  ▼
+              OmniRoute
+                  │
+                  ▼
+               Model
+                  │
+            ┌─────┴─────┐
+            │ tool call │
+            └─────┬─────┘
+                  ▼
+            Agent Runtime
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+     Files       E2B       Database
+You can also use OmniRoute's agent protocols
+
+The current OmniRoute project documents MCP for tool-driven operations and A2A for agent-to-agent workflows, including task operations and streaming.
+
+That gives you another possible architecture later:
+
+Moxie Agent
+    │
+    ▼
+OmniRoute
+    │
+    ├── LLM routing
+    ├── MCP
+    └── A2A
+
+However, I would not make MCP/A2A your foundation yet.
+
+For your first Moxie implementation, keep it simpler:
+
+Inngest
+   ↓
+Moxie Agent
+   ↓
+OpenAI-compatible OmniRoute API
+   ↓
+Model
+
+Then introduce MCP/A2A once the basic agent works.
+
+One very important consideration
+
+OmniRoute itself is a gateway, not your durable execution engine.
+
+Its role is things like:
+
+model selection
+fallback
+routing
+load balancing
+provider health
+rate limits
+caching
+observability
+
+The current project explicitly advertises smart routing, retries, fallbacks, rate-limit handling, caching, and observability.
+
+So your responsibilities should remain separate:
+
+Component	Responsibility
+Next.js	UI/control plane
+tRPC	Application API
+Prisma + Neon	Persistent state
+Inngest	Background jobs/workflows
+Moxie Agent	Agent logic/tool execution
+OmniRoute	AI gateway/model routing
+E2B	Generated-code execution
+GitHub	Source-control workflow
+CodeRabbit	PR review
+
+That's the architecture I would use for Moxie.
+
+The resulting AI pipeline
+USER
+ │
+ ▼
+NEXT.JS
+ │
+ ▼
+tRPC
+ │
+ ▼
+CREATE GENERATION
+ │
+ ▼
+INNGEST
+ │
+ ▼
+MOXIE AGENT
+ │
+ ├──────────────► Project Context
+ │
+ ▼
+OMNIROUTE API
+ │
+ ├── OpenAI
+ ├── Anthropic
+ ├── Grok
+ ├── Other providers
+ │
+ ▼
+MODEL RESPONSE
+ │
+ ▼
+AGENT TOOL CALLS
+ │
+ ├── Files
+ ├── E2B
+ ├── Database
+ ├── Git
+ │
+ ▼
+BUILD / TEST
+ │
+ ├── PASS ──────────────► PREVIEW
+ │
+ └── FAIL
+       │
+       ▼
+   ERROR CONTEXT
+       │
+       ▼
+   INNGEST REPAIR STEP
+       │
+       ▼
+    OMNIROUTE
+       │
+       ▼
+    AI FIX
+       │
+       ▼
+      E2B
+       │
+       └──────────────► PREVIEW
+
+So yes: use the OmniRoute API inside your Inngest background agent jobs. That's probably the cleanest way to build the Moxie AI engine with the stack you've already chosen.
